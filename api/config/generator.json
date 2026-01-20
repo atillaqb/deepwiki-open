@@ -173,9 +173,18 @@
     },
     "azure": {
       "client_class": "AzureAIClient",
-      "default_model": "gpt-4o",
+      "default_model": "gpt-5-nano",
       "supportsCustomModel": true,
       "models": {
+        "gpt-5": {
+          "temperature": 1.0
+        },
+        "gpt-5-nano": {
+          "temperature": 1.0
+        },
+        "gpt-5-mini": {
+          "temperature": 1.0
+        },
         "gpt-4o": {
           "temperature": 0.7,
           "top_p": 0.8
@@ -196,4 +205,3 @@
     }
   }
 }
-
