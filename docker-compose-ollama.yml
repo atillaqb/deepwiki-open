@@ -1,0 +1,36 @@
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    volumes:
+      - ollama_data:/root/.ollama
+    ports:
+      - "11434:11434"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu] # Remove this block if not using NVIDIA GPU
+
+  deepwiki:
+    build:
+      context: .
+      dockerfile: Dockerfile-ollama-local
+    container_name: deepwiki
+    depends_on:
+      - ollama
+    ports:
+      - "3000:3000" # Frontend
+      - "8001:8001" # Backend API
+    environment:
+      - DEEPWIKI_EMBEDDER_TYPE=ollama
+      - OLLAMA_HOST=http://ollama:11434
+    volumes:
+      - adalflow_data:/root/.adalflow
+      # - /path/to/your/repos:/app/local-repos # Optional: mount local repos
+
+volumes:
+  ollama_data:
+  adalflow_data:

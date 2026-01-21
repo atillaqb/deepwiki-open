@@ -39,7 +39,8 @@
     }
   },
   "retriever": {
-    "top_k": 20
+    "top_k": 20,
+    "vector_store_type": "faiss"
   },
   "text_splitter": {
     "split_by": "word",
