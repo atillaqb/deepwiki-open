@@ -219,6 +219,15 @@ OLLAMA_HOST=your_ollama_host # Optional, if Ollama is not local. default: http:/
 
 # Configuration Directory
 DEEPWIKI_CONFIG_DIR=/path/to/custom/config/dir  # Optional, for custom config file location
+
+# Storage (optional S3 for cache/database artifacts)
+DEEPWIKI_STORAGE_BACKEND=s3  # Optional: set to "s3" to enable S3 storage
+DEEPWIKI_S3_BUCKET=your_bucket_name
+DEEPWIKI_S3_PREFIX=deepwiki  # Optional: key prefix inside the bucket
+DEEPWIKI_S3_ENDPOINT_URL=https://s3.your-provider.com  # Optional: for S3-compatible storage
+AWS_ACCESS_KEY_ID=your_access_key  # Standard AWS credentials are used by boto3
+AWS_SECRET_ACCESS_KEY=your_secret_key
+AWS_REGION=your_region
 ```
 
 ### Configuration Files

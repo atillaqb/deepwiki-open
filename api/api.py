@@ -10,6 +10,17 @@ from pydantic import BaseModel, Field
 import google.generativeai as genai
 import asyncio
 
+from api.storage import (
+    build_s3_key,
+    parse_s3_last_modified,
+    s3_delete_object,
+    s3_enabled,
+    s3_list_objects,
+    s3_object_exists,
+    s3_read_json,
+    s3_write_json,
+)
+
 # Configure logging
 from api.logging_config import setup_logging
 
@@ -410,23 +421,37 @@ def get_wiki_cache_path(owner: str, repo: str, repo_type: str, language: str) ->
     filename = f"deepwiki_cache_{repo_type}_{owner}_{repo}_{language}.json"
     return os.path.join(WIKI_CACHE_DIR, filename)
 
+def get_wiki_cache_key(owner: str, repo: str, repo_type: str, language: str) -> str:
+    """Generates the S3 object key for a given wiki cache."""
+    filename = f"deepwiki_cache_{repo_type}_{owner}_{repo}_{language}.json"
+    return build_s3_key("wikicache", filename)
+
 async def read_wiki_cache(owner: str, repo: str, repo_type: str, language: str) -> Optional[WikiCacheData]:
     """Reads wiki cache data from the file system."""
-    cache_path = get_wiki_cache_path(owner, repo, repo_type, language)
-    if os.path.exists(cache_path):
-        try:
-            with open(cache_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
+    if s3_enabled():
+        cache_key = get_wiki_cache_key(owner, repo, repo_type, language)
+        data = s3_read_json(cache_key)
+        if data is not None:
+            try:
                 return WikiCacheData(**data)
-        except Exception as e:
-            logger.error(f"Error reading wiki cache from {cache_path}: {e}")
-            return None
-    return None
+            except Exception as e:
+                logger.error(f"Error reading wiki cache from S3 key {cache_key}: {e}")
+                return None
+        return None
+
+    cache_path = get_wiki_cache_path(owner, repo, repo_type, language)
+    if not os.path.exists(cache_path):
+        return None
+    try:
+        with open(cache_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            return WikiCacheData(**data)
+    except Exception as e:
+        logger.error(f"Error reading wiki cache from {cache_path}: {e}")
+        return None
 
 async def save_wiki_cache(data: WikiCacheRequest) -> bool:
     """Saves wiki cache data to the file system."""
-    cache_path = get_wiki_cache_path(data.repo.owner, data.repo.repo, data.repo.type, data.language)
-    logger.info(f"Attempting to save wiki cache. Path: {cache_path}")
     try:
         payload = WikiCacheData(
             wiki_structure=data.wiki_structure,
@@ -443,17 +468,27 @@ async def save_wiki_cache(data: WikiCacheRequest) -> bool:
         except Exception as ser_e:
             logger.warning(f"Could not serialize payload for size logging: {ser_e}")
 
+        if s3_enabled():
+            cache_key = get_wiki_cache_key(data.repo.owner, data.repo.repo, data.repo.type, data.language)
+            logger.info(f"Writing cache object to S3: {cache_key}")
+            if s3_write_json(cache_key, payload.model_dump()):
+                logger.info("Wiki cache successfully saved to S3")
+                return True
+            logger.error("Failed to save wiki cache to S3")
+            return False
 
+        cache_path = get_wiki_cache_path(data.repo.owner, data.repo.repo, data.repo.type, data.language)
+        logger.info(f"Attempting to save wiki cache. Path: {cache_path}")
         logger.info(f"Writing cache file to: {cache_path}")
         with open(cache_path, 'w', encoding='utf-8') as f:
             json.dump(payload.model_dump(), f, indent=2)
         logger.info(f"Wiki cache successfully saved to {cache_path}")
         return True
     except IOError as e:
-        logger.error(f"IOError saving wiki cache to {cache_path}: {e.strerror} (errno: {e.errno})", exc_info=True)
+        logger.error(f"IOError saving wiki cache: {e.strerror} (errno: {e.errno})", exc_info=True)
         return False
     except Exception as e:
-        logger.error(f"Unexpected error saving wiki cache to {cache_path}: {e}", exc_info=True)
+        logger.error(f"Unexpected error saving wiki cache: {e}", exc_info=True)
         return False
 
 # --- Wiki Cache API Endpoints ---
@@ -523,19 +558,27 @@ async def delete_wiki_cache(
             raise HTTPException(status_code=401, detail="Authorization code is invalid")
 
     logger.info(f"Attempting to delete wiki cache for {owner}/{repo} ({repo_type}), lang: {language}")
-    cache_path = get_wiki_cache_path(owner, repo, repo_type, language)
-
-    if os.path.exists(cache_path):
-        try:
-            os.remove(cache_path)
-            logger.info(f"Successfully deleted wiki cache: {cache_path}")
+    if s3_enabled():
+        cache_key = get_wiki_cache_key(owner, repo, repo_type, language)
+        if not s3_object_exists(cache_key):
+            logger.warning(f"Wiki cache not found in S3, cannot delete: {cache_key}")
+            raise HTTPException(status_code=404, detail="Wiki cache not found")
+        if s3_delete_object(cache_key):
+            logger.info(f"Successfully deleted wiki cache in S3: {cache_key}")
             return {"message": f"Wiki cache for {owner}/{repo} ({language}) deleted successfully"}
-        except Exception as e:
-            logger.error(f"Error deleting wiki cache {cache_path}: {e}")
-            raise HTTPException(status_code=500, detail=f"Failed to delete wiki cache: {str(e)}")
-    else:
+        raise HTTPException(status_code=500, detail="Failed to delete wiki cache")
+
+    cache_path = get_wiki_cache_path(owner, repo, repo_type, language)
+    if not os.path.exists(cache_path):
         logger.warning(f"Wiki cache not found, cannot delete: {cache_path}")
         raise HTTPException(status_code=404, detail="Wiki cache not found")
+    try:
+        os.remove(cache_path)
+        logger.info(f"Successfully deleted wiki cache: {cache_path}")
+        return {"message": f"Wiki cache for {owner}/{repo} ({language}) deleted successfully"}
+    except Exception as e:
+        logger.error(f"Error deleting wiki cache {cache_path}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to delete wiki cache: {str(e)}")
 
 @app.get("/health")
 async def health_check():
@@ -584,45 +627,75 @@ async def get_processed_projects():
     # WIKI_CACHE_DIR is already defined globally in the file
 
     try:
-        if not os.path.exists(WIKI_CACHE_DIR):
-            logger.info(f"Cache directory {WIKI_CACHE_DIR} not found. Returning empty list.")
-            return []
+        if s3_enabled():
+            prefix = build_s3_key("wikicache")
+            logger.info("Scanning for project cache objects in S3 prefix: %s", prefix)
+            objects = s3_list_objects(prefix=prefix)
+            for entry in objects:
+                key = entry.get("key", "")
+                filename = os.path.basename(key)
+                if not (filename.startswith("deepwiki_cache_") and filename.endswith(".json")):
+                    continue
+                parts = filename.replace("deepwiki_cache_", "").replace(".json", "").split('_')
+                if len(parts) < 4:
+                    logger.warning(f"Could not parse project details from filename: {filename}")
+                    continue
+                repo_type = parts[0]
+                owner = parts[1]
+                language = parts[-1]
+                repo = "_".join(parts[2:-1])
+                submitted_at = parse_s3_last_modified(entry.get("last_modified"))
+                project_entries.append(
+                    ProcessedProjectEntry(
+                        id=filename,
+                        owner=owner,
+                        repo=repo,
+                        name=f"{owner}/{repo}",
+                        repo_type=repo_type,
+                        submittedAt=submitted_at or 0,
+                        language=language
+                    )
+                )
+        else:
+            if not os.path.exists(WIKI_CACHE_DIR):
+                logger.info(f"Cache directory {WIKI_CACHE_DIR} not found. Returning empty list.")
+                return []
 
-        logger.info(f"Scanning for project cache files in: {WIKI_CACHE_DIR}")
-        filenames = await asyncio.to_thread(os.listdir, WIKI_CACHE_DIR) # Use asyncio.to_thread for os.listdir
+            logger.info(f"Scanning for project cache files in: {WIKI_CACHE_DIR}")
+            filenames = await asyncio.to_thread(os.listdir, WIKI_CACHE_DIR) # Use asyncio.to_thread for os.listdir
 
-        for filename in filenames:
-            if filename.startswith("deepwiki_cache_") and filename.endswith(".json"):
-                file_path = os.path.join(WIKI_CACHE_DIR, filename)
-                try:
-                    stats = await asyncio.to_thread(os.stat, file_path) # Use asyncio.to_thread for os.stat
-                    parts = filename.replace("deepwiki_cache_", "").replace(".json", "").split('_')
+            for filename in filenames:
+                if filename.startswith("deepwiki_cache_") and filename.endswith(".json"):
+                    file_path = os.path.join(WIKI_CACHE_DIR, filename)
+                    try:
+                        stats = await asyncio.to_thread(os.stat, file_path) # Use asyncio.to_thread for os.stat
+                        parts = filename.replace("deepwiki_cache_", "").replace(".json", "").split('_')
 
-                    # Expecting repo_type_owner_repo_language
-                    # Example: deepwiki_cache_github_AsyncFuncAI_deepwiki-open_en.json
-                    # parts = [github, AsyncFuncAI, deepwiki-open, en]
-                    if len(parts) >= 4:
-                        repo_type = parts[0]
-                        owner = parts[1]
-                        language = parts[-1] # language is the last part
-                        repo = "_".join(parts[2:-1]) # repo can contain underscores
+                        # Expecting repo_type_owner_repo_language
+                        # Example: deepwiki_cache_github_AsyncFuncAI_deepwiki-open_en.json
+                        # parts = [github, AsyncFuncAI, deepwiki-open, en]
+                        if len(parts) >= 4:
+                            repo_type = parts[0]
+                            owner = parts[1]
+                            language = parts[-1] # language is the last part
+                            repo = "_".join(parts[2:-1]) # repo can contain underscores
 
-                        project_entries.append(
-                            ProcessedProjectEntry(
-                                id=filename,
-                                owner=owner,
-                                repo=repo,
-                                name=f"{owner}/{repo}",
-                                repo_type=repo_type,
-                                submittedAt=int(stats.st_mtime * 1000), # Convert to milliseconds
-                                language=language
+                            project_entries.append(
+                                ProcessedProjectEntry(
+                                    id=filename,
+                                    owner=owner,
+                                    repo=repo,
+                                    name=f"{owner}/{repo}",
+                                    repo_type=repo_type,
+                                    submittedAt=int(stats.st_mtime * 1000), # Convert to milliseconds
+                                    language=language
+                                )
                             )
-                        )
-                    else:
-                        logger.warning(f"Could not parse project details from filename: {filename}")
-                except Exception as e:
-                    logger.error(f"Error processing file {file_path}: {e}")
-                    continue # Skip this file on error
+                        else:
+                            logger.warning(f"Could not parse project details from filename: {filename}")
+                    except Exception as e:
+                        logger.error(f"Error processing file {file_path}: {e}")
+                        continue # Skip this file on error
 
         # Sort by most recent first
         project_entries.sort(key=lambda p: p.submittedAt, reverse=True)

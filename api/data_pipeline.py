@@ -17,6 +17,7 @@ import requests
 from requests.exceptions import RequestException
 
 from api.tools.embedder import get_embedder
+from api.storage import build_s3_key, ensure_local_file, s3_enabled, s3_upload_file
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -447,6 +448,15 @@ def transform_documents_and_save_to_db(
     db.transform(key="split_and_embed")
     os.makedirs(os.path.dirname(db_path), exist_ok=True)
     db.save_state(filepath=db_path)
+    if s3_enabled():
+        try:
+            root_path = get_adalflow_default_root_path()
+            rel_path = os.path.relpath(db_path, root_path)
+            db_key = build_s3_key(rel_path)
+            if s3_upload_file(db_path, db_key):
+                logger.info("Uploaded database to S3: %s", db_key)
+        except Exception as exc:
+            logger.warning("Failed to upload database to S3: %s", exc)
     return db
 
 def get_github_file_content(repo_url: str, file_path: str, access_token: str = None) -> str:
@@ -820,9 +830,14 @@ class DatabaseManager:
             self.repo_paths = {
                 "save_repo_dir": save_repo_dir,
                 "save_db_file": save_db_file,
+                "repo_name": repo_name,
             }
             self.repo_url_or_path = repo_url_or_path
             logger.info(f"Repo paths: {self.repo_paths}")
+            if s3_enabled():
+                db_key = build_s3_key("databases", f"{repo_name}.pkl")
+                if ensure_local_file(save_db_file, db_key):
+                    logger.info("Downloaded database from S3 to %s", save_db_file)
 
         except Exception as e:
             logger.error(f"Failed to create repository structure: {e}")
@@ -866,6 +881,11 @@ class DatabaseManager:
         if embedder_type is None and is_ollama_embedder is not None:
             embedder_type = 'ollama' if is_ollama_embedder else None
         # check the database
+        if self.repo_paths:
+            repo_name = self.repo_paths.get("repo_name")
+            if s3_enabled() and repo_name:
+                db_key = build_s3_key("databases", f"{repo_name}.pkl")
+                ensure_local_file(self.repo_paths["save_db_file"], db_key)
         if self.repo_paths and os.path.exists(self.repo_paths["save_db_file"]):
             logger.info("Loading existing database...")
             try:
